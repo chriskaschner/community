@@ -1,32 +1,68 @@
 """
-Applet: Culver's Forecast
-Summary: Culver's 3-Day Forecast
-Description: See the next 3 days of Flavor of the Day at your Culver's with color-coded pixel-art cones.
+Applet: Custard Forecast
+Summary: Custard 3-Day Forecast
+Description: See the next 3 days of Flavor of the Day with color-coded pixel-art cones. Supports Culver's, Kopp's, Gille's, Hefner's, Kraverz, and Oscar's with brand-specific header colors.
 Author: Chris Kaschner
 """
 
 load("cache.star", "cache")
 load("encoding/json.star", "json")
-load("html.star", "html")
 load("http.star", "http")
+load("humanize.star", "humanize")
 load("render.star", "render")
 load("schema.star", "schema")
 load("time.star", "time")
 
-# Culver's locator API (same endpoint used by existing community app)
-LOCATOR_URL = "https://culvers.com/api/locator/getLocations"
-LOCATOR_RADIUS = 40233  # 25 miles in meters
-LOCATOR_LIMIT = 10
+# Worker API base URL (v1 versioned)
+WORKER_BASE = "https://custard-calendar.chris-kaschner.workers.dev"
 
-# Cache TTLs
-HTTP_TTL = 21600  # 6 hours — http.get response cache
-CACHE_TTL = 43200  # 12 hours — parsed flavor data cache
+# Default store when app is unconfigured
+DEFAULT_STORE_SLUG = "mt-horeb"
+DEFAULT_STORE_NAME = "Mt. Horeb"
 
-# Display constants
-WIDTH = 64
-HEIGHT = 32
+# Demo flavor names used as last-resort fallback when API + cache are both unavailable.
+# Dates are computed dynamically in demo_flavors() so they never appear stale.
+DEMO_FLAVOR_NAMES = ["Chocolate Caramel Twist", "Mint Explosion", "Turtle Dove"]
 
-# ─── Color palettes ─────────────────────────────────────────────────
+# Brand theming — drives header color and title text.
+# text_color provides contrast: dark brands get white text, light brands get black.
+BRAND_CONFIG = {
+    "culvers": {"color": "#003366", "text": "#FFFFFF", "label": "Culver's FOTD"},
+    "kopps": {"color": "#000000", "text": "#FFFFFF", "label": "Kopp's FOTD"},
+    "gilles": {"color": "#EBCC35", "text": "#000000", "label": "Gille's FOTD"},
+    "hefners": {"color": "#93BE46", "text": "#000000", "label": "Hefner's FOTD"},
+    "kraverz": {"color": "#CE742D", "text": "#FFFFFF", "label": "Kraverz FOTD"},
+    "oscars": {"color": "#BC272C", "text": "#FFFFFF", "label": "Oscar's FOTD"},
+    "generic": {"color": "#6B4226", "text": "#FFFFFF", "label": "Custard FOTD"},
+}
+
+def brand_from_slug(slug):
+    """Detect brand from store slug, mirroring server BRAND_REGISTRY patterns."""
+    if slug.startswith("kopps-") or slug == "kopps":
+        return "kopps"
+    elif slug == "gilles":
+        return "gilles"
+    elif slug == "hefners":
+        return "hefners"
+    elif slug == "kraverz":
+        return "kraverz"
+    elif slug.startswith("oscars"):
+        return "oscars"
+    return "culvers"
+
+def demo_flavors():
+    """Generate demo flavors with today's date and the next 2 days."""
+    now = time.now()
+    result = []
+    for i in range(len(DEMO_FLAVOR_NAMES)):
+        d = now + time.parse_duration("{}h".format(i * 24))
+        result.append({
+            "name": DEMO_FLAVOR_NAMES[i],
+            "date": d.format("2006-01-02"),
+        })
+    return result
+
+# --- Color palettes ---
 
 BASE_COLORS = {
     "vanilla": "#F5DEB3",
@@ -68,8 +104,7 @@ TOPPING_COLORS = {
     "reeses": "#D4A017",
 }
 
-# ─── Flavor profiles ────────────────────────────────────────────────
-
+# Flavor profiles: lowercase name -> {base, ribbon, toppings, density}
 FLAVOR_PROFILES = {
     "dark chocolate pb crunch": {
         "base": "dark_chocolate",
@@ -247,7 +282,7 @@ FLAVOR_PROFILES = {
     },
 }
 
-# ─── Rendering helpers ───────────────────────────────────────────────
+# --- Flavor profile lookup ---
 
 def get_flavor_profile(flavor_name):
     """Look up flavor profile by name, with keyword fallback for unknown flavors."""
@@ -281,8 +316,10 @@ def get_flavor_profile(flavor_name):
         return {"base": "vanilla", "ribbon": None, "toppings": [], "density": "standard"}
     return {"base": "vanilla", "ribbon": None, "toppings": [], "density": "standard"}
 
+# --- Mini cone renderer ---
+
 def create_mini_cone(profile):
-    """Create a mini ice cream cone (9x11) with profile-driven rendering.
+    """Create a mini ice cream cone (9x11) per profile-driven rendering.
 
     Geometry: 6-row scoop (no outline), 4-row checkerboard cone, 1px tip.
     Rendering order: base fill -> toppings -> ribbon (ribbon wins at overlap) -> cone -> tip.
@@ -292,25 +329,32 @@ def create_mini_cone(profile):
     topping_keys = profile.get("toppings", [])
     density = profile.get("density", "standard")
 
+    # Ribbon present unless pure density or no ribbon defined
     has_ribbon = ribbon_key != None and density != "pure"
 
+    # Determine topping slots based on density encoding
     topping_slots = []
 
     if density == "pure":
-        pass
+        pass  # No toppings, no ribbon
     elif density == "double":
+        # Duplicate primary topping in T1 and T2
         if len(topping_keys) > 0:
             topping_slots = [topping_keys[0], topping_keys[0]]
             if len(topping_keys) > 1:
                 topping_slots.append(topping_keys[1])
     elif density == "explosion":
+        # Use 3-4 topping slots
         topping_slots = list(topping_keys[:4])
     elif density == "overload":
+        # Duplicate dominant topping
         if len(topping_keys) > 0:
             topping_slots = [topping_keys[0], topping_keys[0]]
     else:
+        # standard: fill slots in order
         topping_slots = list(topping_keys[:4])
 
+    # Build overlay children (toppings first, then ribbon on top)
     overlays = []
 
     if len(topping_slots) > 0:
@@ -429,10 +473,14 @@ def create_mini_cone(profile):
         ] + overlays,
     )
 
-def format_flavor_for_display(name, max_chars = 5):
-    """Format flavor name using base noun anchoring.
+# --- Text formatting for small displays ---
 
-    Returns [line1, line2] where line2 = base noun, line1 = descriptors.
+def format_flavor_for_display(name, max_chars = 5):
+    """Format flavor name using base noun anchoring principle.
+
+    Returns [line1, line2] where:
+    - line2 = base noun (anchor)
+    - line1 = descriptors/modifiers
     Max 5 chars per line for optimal 3-cone display.
     """
 
@@ -512,7 +560,7 @@ def format_flavor_for_display(name, max_chars = 5):
         "Dove",
     ]
 
-    # Abbreviation map (optimized for 5 chars)
+    # Comprehensive abbreviation map (optimized for 5 chars)
     abbr_map = {
         "Chocolate": "Choc",
         "Caramel": "Crml",
@@ -543,6 +591,7 @@ def format_flavor_for_display(name, max_chars = 5):
         "Butter": "Buttr",
     }
 
+    # Apply abbreviations to full name first
     abbreviated = name
     for full, short in abbr_map.items():
         abbreviated = abbreviated.replace(full, short)
@@ -552,35 +601,46 @@ def format_flavor_for_display(name, max_chars = 5):
     if len(words) == 0:
         return ["???"]
 
+    # Detect base noun (last word matching whitelist)
     base_noun = ""
     desc_words = words
 
+    # Check if last word is a known base noun
     if words[-1] in base_nouns:
         base_noun = words[-1]
         desc_words = words[:-1]
+
+        # Check for 2-word base nouns (Cookie Dough, Layer Cake, etc.)
     elif len(words) >= 2:
         two_word = " ".join(words[-2:])
         if two_word in ["Cook Dough", "Layer Cake", "Batt Bliss"]:
             base_noun = two_word
             desc_words = words[:-2]
         else:
+            # Default: last word is base noun
             base_noun = words[-1]
             desc_words = words[:-1]
     else:
+        # Single word
         return [words[0][:max_chars]]
 
+    # Build lines
     line1 = " ".join(desc_words) if desc_words else ""
     line2 = base_noun
 
+    # Trim line1 if too long
     if len(line1) > max_chars:
+        # Try dropping least important word (first descriptor)
         if len(desc_words) > 1:
             line1 = " ".join(desc_words[1:])
         if len(line1) > max_chars:
             line1 = line1[:max_chars]
 
+    # Trim line2 if too long (last resort)
     if len(line2) > max_chars:
         line2 = line2[:max_chars]
 
+    # Return appropriate format
     if line1 and line2:
         return [line1, line2]
     elif line2:
@@ -588,17 +648,21 @@ def format_flavor_for_display(name, max_chars = 5):
     else:
         return [name[:max_chars]]
 
-# ─── View builders ───────────────────────────────────────────────────
+# --- Three-day view layout ---
 
-def create_three_day_view(flavors, location_name):
+def create_three_day_view(flavors, location_name, brand_color = "#003366", text_color = "#FFFFFF"):
     """Create 3-day forecast with mini cones and flavor names.
 
     Pixel budget (32px):
-      y=0-4:  header (5px blue, descent clipped)
+      y=0-4:  header (5px brand color, descent clipped)
       y=5:    gap (1px black)
       y=6-31: content (26px per column)
+      y=30:   cone tips / text baselines
+      y=31:   descenders only (or black)
     """
     columns = []
+
+    # Target column height: fills y=6 to y=31
     col_height = 26
     cone_height = 11
 
@@ -618,9 +682,11 @@ def create_three_day_view(flavors, location_name):
             )
 
         cone = create_mini_cone(profile)
-        text_height = len(name_lines) * 6
+        text_height = len(name_lines) * 6  # tom-thumb = 6px per line
 
+        # Staggered layout with dynamic spacer to fill 26px exactly
         if i == 1:
+            # Middle: cone top, text bottom (descenders reach y=31)
             spacer = col_height - cone_height - text_height
             column = render.Column(
                 main_align = "start",
@@ -628,6 +694,7 @@ def create_three_day_view(flavors, location_name):
                 children = [cone, render.Box(width = 1, height = spacer)] + text_children,
             )
         else:
+            # Outer: text top, cone bottom (tip at y=30, 1px pad at y=31)
             spacer = col_height - text_height - cone_height - 1
             column = render.Padding(
                 pad = (0, 0, 0, 1),
@@ -640,36 +707,43 @@ def create_three_day_view(flavors, location_name):
 
         columns.append(column)
 
+    # Pad with empty columns if less than 3 flavors
     if len(columns) < 3:
         for _ in range(3 - len(columns)):
             columns.append(render.Box(width = 1))
 
     return render.Box(
-        width = WIDTH,
-        height = HEIGHT,
+        width = 64,
+        height = 32,
         child = render.Column(
             main_align = "space_between",
             cross_align = "center",
             expanded = True,
             children = [
+                # Header: 6px tall (full font height), brand color behind y=0-4
+                # y=5 is descent row with no color = appears black
                 render.Box(
-                    width = WIDTH,
+                    width = 64,
                     height = 6,
                     child = render.Stack(
                         children = [
-                            render.Box(width = WIDTH, height = 5, color = "#003366"),
+                            render.Box(width = 64, height = 5, color = brand_color),
                             render.Box(
-                                width = WIDTH,
+                                width = 64,
                                 height = 6,
-                                child = render.Text(
-                                    content = location_name,
-                                    font = "tom-thumb",
-                                    color = "#FFFFFF",
+                                child = render.Marquee(
+                                    width = 64,
+                                    child = render.Text(
+                                        content = location_name,
+                                        font = "tom-thumb",
+                                        color = text_color,
+                                    ),
                                 ),
                             ),
                         ],
                     ),
                 ),
+                # Content: pinned to bottom via space_between
                 render.Row(
                     main_align = "space_evenly",
                     children = columns,
@@ -678,233 +752,170 @@ def create_three_day_view(flavors, location_name):
         ),
     )
 
-# ─── Data fetching ───────────────────────────────────────────────────
+# --- Data fetching with two-tier cache ---
 
-def clean_text(text):
-    """Remove trademark symbols and normalize whitespace."""
-    text = text.replace("\u00ae", "")  # ®
-    text = text.replace("\u2122", "")  # ™
-    text = text.replace("\u00a9", "")  # ©
-    return " ".join(text.split())
+def fetch_flavors(slug):
+    """Fetch flavor data from Worker API with two-tier cache resilience.
 
-def parse_flavor_calendar(body):
-    """Parse __NEXT_DATA__ from restaurant page HTML to extract flavor calendar.
+    Tier 1: Primary cache key with 12h TTL (normal refresh cycle).
+    Tier 2: Stale cache key with 1h TTL, re-persisted on every read.
+             Since Tidbyt renders every ~15 min, the stale key stays
+             alive indefinitely through continuous re-persist.
+    Tier 3: demo_flavors() as absolute last resort.
 
-    Returns dict with "name" (restaurant name) and "flavors" (list of {date, name}).
-    Uses html.star with string-index fallback.
+    Network resilience: http.get() uses ttl_seconds = 3600 (max allowed)
+    so pixlet's built-in HTTP cache can serve stale responses when the
+    network is unreachable, preventing script crashes after the first
+    successful fetch.
     """
+    cache_key = "flavors:{}".format(slug)
+    stale_key = "flavors_stale:{}".format(slug)
 
-    # Primary: use html.star CSS selector
-    script_text = ""
-    doc = html(body)
-    node = doc.find("#__NEXT_DATA__")
-    if node.len() > 0:
-        script_text = node.eq(0).text()
-
-    # Fallback: string search if html.star didn't find it
-    if not script_text:
-        marker = '__NEXT_DATA__"'
-        idx = body.find(marker)
-        if idx == -1:
-            return None
-        gt_idx = body.find(">", idx)
-        if gt_idx == -1:
-            return None
-        end_idx = body.find("</script>", gt_idx)
-        if end_idx == -1:
-            return None
-        script_text = body[gt_idx + 1:end_idx]
-
-    if not script_text:
-        return None
-
-    data = json.decode(script_text)
-    props = data.get("props", data)
-    page_props = props.get("pageProps", {})
-    page = page_props.get("page", {})
-    custom_data = page.get("customData", {})
-    calendar = custom_data.get("restaurantCalendar", {})
-    raw_flavors = calendar.get("flavors", [])
-    restaurant_details = custom_data.get("restaurantDetails", {})
-    restaurant_name = clean_text(restaurant_details.get("name", ""))
-
-    # Parse flavors
-    flavors = []
-    for f in raw_flavors:
-        on_date = f.get("onDate", "")
-        date = on_date.split("T")[0]
-        title = clean_text(f.get("title", ""))
-        if date and title:
-            flavors.append({"date": date, "name": title})
-
-    return {"name": restaurant_name, "flavors": flavors}
-
-def fetch_flavor_calendar(slug):
-    """Fetch restaurant page and parse flavor calendar.
-
-    Returns list of {date, name} dicts for today and future, or None on error.
-    """
-    url = "https://www.culvers.com/restaurants/%s" % slug
-    resp = http.get(url, ttl_seconds = HTTP_TTL)
-    if resp.status_code != 200:
-        return None
-
-    result = parse_flavor_calendar(resp.body())
-    if not result:
-        return None
-
-    # Filter to today and future (use Central time — most Culver's are CT)
-    now = time.now().in_location("America/Chicago")
-    today = now.format("2006-01-02")
-
-    filtered = []
-    for f in result["flavors"]:
-        if f["date"] >= today:
-            filtered.append(f)
-
-    return {"name": result["name"], "flavors": filtered}
-
-def get_flavors_for_display(config):
-    """Cache orchestrator: return flavor data from cache or fetch.
-
-    Returns dict with "name" (location) and "flavors" (list of {date, name}),
-    or None on error.
-    """
-    location_data = get_location_from_config(config)
-    if not location_data:
-        return None
-
-    slug = location_data["slug"]
-    name = location_data["name"]
-    cache_key = "culvers_forecast_%s" % slug
-
-    # Check app-level cache first
+    # Tier 1: Check primary cache
     cached = cache.get(cache_key)
-    if cached:
-        return json.decode(cached)
+    if cached != None:
+        data = json.decode(cached)
 
-    # Fetch from restaurant page
-    result = fetch_flavor_calendar(slug)
-    if not result:
-        return None
+        # Re-persist stale copy (keeps it alive as long as app renders)
+        cache.set(stale_key, cached, ttl_seconds = 3600)
+        return data
 
-    # Use fetched restaurant name, fall back to stored name
-    if not result["name"]:
-        result["name"] = name
+    # Tier 2: Check stale cache BEFORE making a network call.
+    stale = cache.get(stale_key)
+    if stale != None:
+        data = json.decode(stale)
 
-    # Store in app-level cache
-    cache.set(cache_key, json.encode(result), ttl_seconds = CACHE_TTL)
+        # Re-persist stale to keep it alive
+        cache.set(stale_key, stale, ttl_seconds = 3600)
 
-    return result
+        # Still attempt a background-style refresh via http.get with max
+        # ttl_seconds. If the HTTP cache has a response, this is instant
+        # and free. If not, it fetches and populates the HTTP cache for
+        # next render cycle.
+        url = "{}/api/v1/flavors?slug={}".format(WORKER_BASE, humanize.url_encode(slug))
+        rep = http.get(url, ttl_seconds = 3600)
+        if rep.status_code == 200:
+            mapped = _map_flavor_response(rep.json())
+            encoded = json.encode(mapped)
+            cache.set(cache_key, encoded, ttl_seconds = 43200)
+            cache.set(stale_key, encoded, ttl_seconds = 3600)
+        return data
 
-def get_location_from_config(config):
-    """Extract slug and name from config's location field.
+    # Both caches empty: fetch from Worker API.
+    url = "{}/api/v1/flavors?slug={}".format(WORKER_BASE, humanize.url_encode(slug))
+    rep = http.get(url, ttl_seconds = 3600)
 
-    The location value is JSON: {"slug": "mt-horeb", "name": "Mt. Horeb"}
-    """
-    raw = config.get("restaurant_location")
-    if not raw:
-        return None
+    if rep.status_code == 200:
+        mapped = _map_flavor_response(rep.json())
 
-    # The schema.LocationBased wraps the value in another JSON object
-    loc = json.decode(raw)
-    value = loc.get("value", raw)
+        # Persist to both cache tiers
+        encoded = json.encode(mapped)
+        cache.set(cache_key, encoded, ttl_seconds = 43200)  # 12 hours
+        cache.set(stale_key, encoded, ttl_seconds = 3600)  # 1 hour
 
-    # The value itself is our JSON-encoded slug+name
-    info = json.decode(value)
-    return info
+        return mapped
 
-# ─── Schema: location search ────────────────────────────────────────
+    # Tier 3: HTTP error (non-200), return demo flavors
+    return demo_flavors()
 
-def get_restaurants(location):
-    """schema.LocationBased handler: find nearby Culver's restaurants."""
-    loc = json.decode(location)
+def _map_flavor_response(data):
+    """Map Worker API field names to renderer field names."""
+    flavors = data.get("flavors", [])
+    mapped = []
+    for f in flavors:
+        mapped.append({
+            "name": f.get("title", "Unknown"),
+            "date": f.get("date", ""),
+        })
+    return mapped
 
-    resp = http.get(
-        "%s?lat=%s&long=%s&radius=%d&limit=%d" % (
-            LOCATOR_URL,
-            loc["lat"],
-            loc["lng"],
-            LOCATOR_RADIUS,
-            LOCATOR_LIMIT,
-        ),
-        ttl_seconds = HTTP_TTL,
-    )
-    if resp.status_code != 200:
+# --- Typeahead store search ---
+
+def search_stores(pattern):
+    """Handler for schema.Typeahead — searches Worker API for matching stores across all brands."""
+    if len(pattern) < 2:
         return []
 
-    data = resp.json()
-    geofences = data.get("data", {}).get("geofences", [])
+    url = "{}/api/v1/stores?q={}".format(WORKER_BASE, humanize.url_encode(pattern))
+    rep = http.get(url, ttl_seconds = 3600)  # max allowed; store list is static
 
-    options = []
-    for restaurant in geofences:
-        description = restaurant.get("description", "Unknown")
-        metadata = restaurant.get("metadata", {})
-        slug = metadata.get("slug", "")
+    if rep.status_code != 200:
+        return []
 
-        if not slug:
-            continue
+    data = rep.json()
+    stores = data.get("stores", [])
 
-        value = json.encode({"slug": slug, "name": description})
-        options.append(
+    results = []
+    for store in stores:
+        results.append(
             schema.Option(
-                display = description,
-                value = value,
+                display = store.get("name", "Unknown"),
+                value = store.get("slug", ""),
             ),
         )
 
-    return options
+    return results
 
-# ─── Entry points ────────────────────────────────────────────────────
+# --- App entry point ---
 
 def main(config):
-    """Main render entry point."""
+    """Main entry point — fetches flavors and renders 3-day view."""
+
+    # Read store selection from schema config
+    store_json = config.get("store")
+    if store_json:
+        store = json.decode(store_json)
+        slug = store.get("value", DEFAULT_STORE_SLUG)
+        display_name = store.get("display", DEFAULT_STORE_NAME)
+    else:
+        # Unconfigured: use default store
+        slug = DEFAULT_STORE_SLUG
+        display_name = DEFAULT_STORE_NAME
+
+    # Detect brand from slug and get theme
+    brand_key = brand_from_slug(slug)
+    brand_cfg = BRAND_CONFIG.get(brand_key, BRAND_CONFIG["culvers"])
 
     # Fetch flavor data
-    flavor_data = get_flavors_for_display(config)
+    flavors = fetch_flavors(slug)
 
-    if not flavor_data or len(flavor_data.get("flavors", [])) == 0:
-        return render.Root(
-            child = render.Box(
-                width = WIDTH,
-                height = HEIGHT,
-                child = render.Column(
-                    main_align = "center",
-                    cross_align = "center",
-                    children = [
-                        render.Text(
-                            content = "Culver's",
-                            font = "tom-thumb",
-                            color = "#FFFFFF",
-                        ),
-                        render.Text(
-                            content = "No flavors",
-                            font = "tom-thumb",
-                            color = "#888888",
-                        ),
-                    ],
-                ),
-            ),
-        )
+    # Filter to today and future dates
+    now = time.now()
+    today = now.format("2006-01-02")
 
+    upcoming = []
+    for f in flavors:
+        if f.get("date", "") >= today:
+            upcoming.append(f)
+
+    # Use upcoming flavors if available, otherwise show whatever we have
+    header_name = display_name
+    if len(upcoming) > 0:
+        display_flavors = upcoming
+    elif len(flavors) > 0:
+        # All dates are in the past (stale cache) — show last 3 as-is
+        display_flavors = flavors
+        header_name = "stale data - {}".format(display_name)
+    else:
+        display_flavors = demo_flavors()
+
+    # Render three-day view with brand-specific header
     return render.Root(
-        child = create_three_day_view(
-            flavor_data["flavors"],
-            flavor_data["name"],
-        ),
+        delay = 75,  # ms between frames (enables marquee animation)
+        child = create_three_day_view(display_flavors, header_name, brand_cfg["color"], brand_cfg["text"]),
     )
 
 def get_schema():
-    """Configuration schema for the Tidbyt app."""
+    """Configuration schema — store selection via typeahead search."""
     return schema.Schema(
         version = "1",
         fields = [
-            schema.LocationBased(
-                id = "restaurant_location",
-                name = "Culver's Location",
-                desc = "Pick your Culver's restaurant.",
-                icon = "iceCream",
-                handler = get_restaurants,
+            schema.Typeahead(
+                id = "store",
+                name = "Store",
+                desc = "Search for your nearest custard store (Culver's, Kopp's, Gille's, and more)",
+                icon = "magnifyingGlass",
+                handler = search_stores,
             ),
         ],
     )
